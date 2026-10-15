@@ -1,7 +1,6 @@
 # =============================================================
 # Cyber Buddy Backend - app.py
-# Local: python app.py -> http://localhost:5000
-# Production: gunicorn app:app  (see Procfile)
+# Run: python app.py  then visit  http://localhost:5000
 # =============================================================
 
 from flask import Flask, request, jsonify, session, render_template
@@ -16,83 +15,30 @@ import time
 import requests
 from groq import Groq
 
-# All configuration comes from environment variables (see .env.example).
-# Locally you can put them in a .env file; in production set them in your host's dashboard.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-IS_PROD = os.environ.get('FLASK_ENV', 'development') == 'production'
-
 app = Flask(__name__, template_folder='templates')
-app.secret_key = os.environ.get('SECRET_KEY', 'dev-only-change-me')
+app.secret_key = 'phishguard_secret_key_do_not_share'
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = IS_PROD          # HTTPS-only cookies in production
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024    # 32 MB upload limit for file scanner
-
-# Frontend is served by Flask itself (same origin), so CORS is only needed for local dev.
-CORS(app, supports_credentials=True,
-     origins=os.environ.get('CORS_ORIGINS', 'http://localhost:5000').split(','))
+app.config['SESSION_COOKIE_SECURE'] = False
+CORS(app, supports_credentials=True, origins=['http://localhost:5000'])
 
 # ── API SETUP ───────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
-groq_client  = Groq(api_key=GROQ_API_KEY or 'missing')
-VT_API_KEY   = os.environ.get('VT_API_KEY', '')
-VT_HEADERS   = {"x-apikey": VT_API_KEY}
+GROQ_API_KEY = "" 
+groq_client  = Groq(api_key=GROQ_API_KEY)
+VT_API_KEY     = ""
+VT_HEADERS     = {"x-apikey": VT_API_KEY}
 
 
 # ── DATABASE CONFIG ────────────────────────────────────────────
+# CHANGE these values to match your MySQL setup
 DB_CONFIG = {
-    "host":     os.environ.get('DB_HOST', 'localhost'),
-    "port":     int(os.environ.get('DB_PORT', '3306')),
-    "user":     os.environ.get('DB_USER', 'root'),
-    "password": os.environ.get('DB_PASSWORD', ''),
-    "database": os.environ.get('DB_NAME', 'cyberbuddy'),
+    "host": "localhost",
+    "user": "root",
+    "password": "tiger",          # your MySQL root password
+    "database": "cyberbuddy"
 }
-# Most managed MySQL providers (Aiven, PlanetScale, TiDB, ...) require SSL.
-if os.environ.get('DB_SSL', 'false').lower() == 'true':
-    DB_CONFIG["ssl_disabled"] = False
-    ca = os.environ.get('DB_SSL_CA')
-    if ca:
-        DB_CONFIG["ssl_ca"] = ca
 
 def get_db():
     return mysql.connector.connect(**DB_CONFIG)
-
-def init_db():
-    """Create tables automatically on startup (safe to run repeatedly)."""
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS users (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL,
-            name VARCHAR(100) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) DEFAULT CHARSET=utf8mb4""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS scores (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id INT NOT NULL,
-            score INT NOT NULL,
-            total_questions INT NOT NULL,
-            difficulty VARCHAR(20) NOT NULL,
-            accuracy DECIMAL(5,2) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_scores_user (user_id),
-            INDEX idx_scores_date (created_at),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        ) DEFAULT CHARSET=utf8mb4""")
-        db.commit()
-        db.close()
-        print("Database tables ready.")
-    except Exception as e:
-        print("WARNING: could not initialise database:", e)
-
-init_db()
 
 def hash_password(password):
     """Simple SHA-256 password hashing with salt"""
@@ -127,10 +73,6 @@ def parse_ai_json(raw):
 @app.route('/')
 def index():
     return render_template('index.html')
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'})
 
 # ── AUTH ROUTES ────────────────────────────────────────────────
 
@@ -687,5 +629,4 @@ if __name__ == '__main__':
     print("  Cyber Buddy Server Starting...")
     print("  Visit: http://localhost:5000")
     print("="*55 + "\n")
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=not IS_PROD)
+    app.run(debug=True, port=5000)

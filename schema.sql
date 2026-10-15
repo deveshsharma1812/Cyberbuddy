@@ -30,6 +30,6 @@ CREATE TABLE IF NOT EXISTS scores (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
--- Indexes (app.py already creates these automatically; run only if using schema.sql by hand)
-CREATE INDEX idx_scores_user ON scores(user_id);
-CREATE INDEX idx_scores_date ON scores(created_at);
+-- Indexes for faster queries
+CREATE INDEX IF NOT EXISTS idx_scores_user ON scores(user_id);
+CREATE INDEX IF NOT EXISTS idx_scores_date ON scores(created_at);
