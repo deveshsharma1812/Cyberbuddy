@@ -1,0 +1,691 @@
+# =============================================================
+# Cyber Buddy Backend - app.py
+# Local: python app.py -> http://localhost:5000
+# Production: gunicorn app:app  (see Procfile)
+# =============================================================
+
+from flask import Flask, request, jsonify, session, render_template
+from flask_cors import CORS
+import mysql.connector
+import hashlib
+import json
+import base64
+import re
+import os
+import time
+import requests
+from groq import Groq
+
+# All configuration comes from environment variables (see .env.example).
+# Locally you can put them in a .env file; in production set them in your host's dashboard.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+IS_PROD = os.environ.get('FLASK_ENV', 'development') == 'production'
+
+app = Flask(__name__, template_folder='templates')
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-only-change-me')
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = IS_PROD          # HTTPS-only cookies in production
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024    # 32 MB upload limit for file scanner
+
+# Frontend is served by Flask itself (same origin), so CORS is only needed for local dev.
+CORS(app, supports_credentials=True,
+     origins=os.environ.get('CORS_ORIGINS', 'http://localhost:5000').split(','))
+
+# ── API SETUP ───────────────────────────────────────────────
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+groq_client  = Groq(api_key=GROQ_API_KEY or 'missing')
+VT_API_KEY   = os.environ.get('VT_API_KEY', '')
+VT_HEADERS   = {"x-apikey": VT_API_KEY}
+
+
+# ── DATABASE CONFIG ────────────────────────────────────────────
+DB_CONFIG = {
+    "host":     os.environ.get('DB_HOST', 'localhost'),
+    "port":     int(os.environ.get('DB_PORT', '3306')),
+    "user":     os.environ.get('DB_USER', 'root'),
+    "password": os.environ.get('DB_PASSWORD', ''),
+    "database": os.environ.get('DB_NAME', 'cyberbuddy'),
+}
+# Most managed MySQL providers (Aiven, PlanetScale, TiDB, ...) require SSL.
+if os.environ.get('DB_SSL', 'false').lower() == 'true':
+    DB_CONFIG["ssl_disabled"] = False
+    ca = os.environ.get('DB_SSL_CA')
+    if ca:
+        DB_CONFIG["ssl_ca"] = ca
+
+def get_db():
+    return mysql.connector.connect(**DB_CONFIG)
+
+def init_db():
+    """Create tables automatically on startup (safe to run repeatedly)."""
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) DEFAULT CHARSET=utf8mb4""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS scores (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            score INT NOT NULL,
+            total_questions INT NOT NULL,
+            difficulty VARCHAR(20) NOT NULL,
+            accuracy DECIMAL(5,2) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_scores_user (user_id),
+            INDEX idx_scores_date (created_at),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) DEFAULT CHARSET=utf8mb4""")
+        db.commit()
+        db.close()
+        print("Database tables ready.")
+    except Exception as e:
+        print("WARNING: could not initialise database:", e)
+
+init_db()
+
+def hash_password(password):
+    """Simple SHA-256 password hashing with salt"""
+    salt = "phishguard2025salt"
+    return hashlib.sha256((salt + password).encode()).hexdigest()
+
+def call_ai(prompt, json_mode=False, max_tokens=2048):
+    """Call Groq; request valid JSON explicitly for structured tasks."""
+    kwargs = dict(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=max_tokens,
+    )
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = groq_client.chat.completions.create(**kwargs)
+    content = response.choices[0].message.content or ""
+    if not content.strip():
+        raise ValueError("Groq returned an empty response. Please retry.")
+    return re.sub(r'^```(?:json)?\s*|\s*```$', '', content.strip(), flags=re.I).strip()
+
+
+def parse_ai_json(raw):
+    """Accept a JSON response and report incomplete output clearly."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("AI response was incomplete or invalid JSON. Try fewer questions or retry.") from exc
+
+# ── SERVE FRONTEND ─────────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
+
+# ── AUTH ROUTES ────────────────────────────────────────────────
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username', '').strip().lower()
+    password = data.get('password', '').strip()
+    name     = data.get('name', '').strip()
+
+    if not username or not password or not name:
+        return jsonify({'success': False, 'error': 'All fields are required'}), 400
+
+    if len(username) < 3:
+        return jsonify({'success': False, 'error': 'Username must be at least 3 characters'}), 400
+
+    if len(password) < 6:
+        return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
+
+    try:
+        db  = get_db()
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO users (username, password_hash, name) VALUES (%s, %s, %s)",
+            (username, hash_password(password), name)
+        )
+        db.commit()
+        user_id = cur.lastrowid
+        db.close()
+
+        session['user_id']  = user_id
+        session['username'] = username
+        session['name']     = name
+
+        return jsonify({'success': True, 'name': name, 'username': username})
+
+    except mysql.connector.IntegrityError:
+        return jsonify({'success': False, 'error': 'Username already taken. Try another one.'}), 409
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data     = request.json
+    username = data.get('username', '').strip().lower()
+    password = data.get('password', '').strip()
+
+    try:
+        db  = get_db()
+        cur = db.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, name, username FROM users WHERE username=%s AND password_hash=%s",
+            (username, hash_password(password))
+        )
+        user = cur.fetchone()
+        db.close()
+
+        if user:
+            session['user_id']  = user['id']
+            session['username'] = user['username']
+            session['name']     = user['name']
+            return jsonify({'success': True, 'name': user['name'], 'username': user['username']})
+        else:
+            return jsonify({'success': False, 'error': 'Wrong username or password'}), 401
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True})
+
+
+@app.route('/api/me', methods=['GET'])
+def me():
+    if 'user_id' in session:
+        return jsonify({'loggedIn': True, 'name': session['name'], 'username': session['username']})
+    return jsonify({'loggedIn': False})
+
+# ── SCORE ROUTES ───────────────────────────────────────────────
+
+@app.route('/api/save-score', methods=['POST'])
+def save_score():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+
+    data = request.json
+    try:
+        accuracy = round((data['score'] / data['total']) * 100, 2)
+        db  = get_db()
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO scores (user_id, score, total_questions, difficulty, accuracy) VALUES (%s,%s,%s,%s,%s)",
+            (session['user_id'], data['score'], data['total'], data['difficulty'], accuracy)
+        )
+        db.commit()
+        db.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/my-scores', methods=['GET'])
+def my_scores():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+
+    try:
+        db  = get_db()
+        cur = db.cursor(dictionary=True)
+        cur.execute("""
+            SELECT score, total_questions, difficulty, accuracy,
+                   DATE_FORMAT(created_at, '%d %b %Y %H:%i') AS date
+            FROM scores
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT 10
+        """, (session['user_id'],))
+        rows = cur.fetchall()
+        db.close()
+        return jsonify({'success': True, 'scores': rows})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ── QUIZ GENERATION ───────────────────────────────────
+
+@app.route('/api/generate-questions', methods=['POST'])
+def generate_questions():
+    data       = request.json
+    difficulty = data.get('difficulty', 'medium')
+    count      = min(max(int(data.get('count', 5)), 1), 20)  # clamp 1-20
+
+    prompt = f"""You are creating a phishing detection quiz. Generate exactly {count} quiz questions at '{difficulty}' difficulty.
+
+Return ONLY a raw JSON array — no markdown, no explanation, no code fences.
+
+Each item must follow this exact schema:
+{{
+  "type": "email",
+  "sender": "noreply@example.com",
+  "senderName": "Example Bank",
+  "subject": "Subject line",
+  "body": "HTML message body. Wrap suspicious parts like <span class='red-flag'>bad link</span>",
+  "answer": "phishing",
+  "explanation": "One-sentence explanation",
+  "clues": ["Clue 1", "Clue 2", "Clue 3"]
+}}
+
+Difficulty guidelines:
+- easy: obvious lottery scams, bad grammar, clearly fake links, obvious red flags
+- medium: typosquatting (paypa1.com), SMS spoofing, realistic-looking fakes with subtle issues
+- hard: near-perfect fakes with very subtle domain differences or social engineering
+
+Constraints:
+- type is one of: email, sms, whatsapp
+- answer is exactly: phishing OR legit
+- ~60% phishing, ~40% legit per batch
+- Use realistic Indian context: SBI, HDFC, ICICI, Amazon India, Paytm, UPI, Aadhaar, SSC, etc.
+- clues: 3–5 items explaining the key indicators
+- For phishing: mark suspicious URLs/text with <span class='red-flag'>text</span>
+"""
+
+    # JSON Object Mode requires an object rather than a top-level array.
+    prompt += "\nReturn one JSON object with a single key \"questions\" containing the requested array."
+    try:
+        raw = call_ai(prompt, json_mode=True, max_tokens=min(12000, 1200 + count * 650))
+        result = parse_ai_json(raw)
+        questions = result.get('questions') if isinstance(result, dict) else None
+        required = {'type', 'sender', 'senderName', 'subject', 'body', 'answer', 'explanation', 'clues'}
+        if not isinstance(questions, list) or not questions:
+            raise ValueError('AI did not return a questions list. Please retry.')
+        for q in questions:
+            if (not isinstance(q, dict) or not required.issubset(q)
+                    or q['type'] not in ('email', 'sms', 'whatsapp')
+                    or q['answer'] not in ('phishing', 'legit')
+                    or not isinstance(q['clues'], list)):
+                raise ValueError('AI returned an invalid quiz question. Please retry.')
+        return jsonify({'success': True, 'questions': questions})
+    except Exception as e:
+        app.logger.warning('Quiz generation failed: %s', e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ── PASSWORD STRENGTH ─────────────────────────────────
+
+@app.route('/api/check-password', methods=['POST'])
+def check_password():
+    data     = request.json
+    password = data.get('password', '')
+
+    if not password:
+        return jsonify({'success': False, 'error': 'No password provided'}), 400
+
+    prompt = f"""Analyze password strength for: "{password}"
+
+Return ONLY a raw JSON object, no markdown, no explanation:
+{{
+  "score": 72,
+  "rating": "Strong",
+  "crackTimeOffline": "4 years",
+  "crackTimeOnline": "centuries",
+  "entropy": 48.2,
+  "issues": ["No special characters", "Contains dictionary word"],
+  "suggestions": ["Add symbols like !@#$", "Mix uppercase and lowercase"],
+  "verdict": "Decent password but can be improved",
+  "color": "orange"
+}}
+
+score: 0–100
+rating: "Very Weak" | "Weak" | "Fair" | "Strong" | "Very Strong"
+crackTimeOffline: time for fast offline GPU attack
+crackTimeOnline: time for slow online attack (rate-limited)
+entropy: Shannon entropy in bits
+color: "red" (<30) | "orange" (30–59) | "yellow" (60–79) | "green" (80–89) | "cyan" (90+)
+"""
+
+    try:
+        result = json.loads(call_ai(prompt))
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ── PHISHING DETECTION ────────────────────────────────
+
+@app.route('/api/check-phishing', methods=['POST'])
+def check_phishing():
+    text = request.form.get('text', '').strip()
+    file = request.files.get('file')
+
+    # ── FILE UPLOAD → VirusTotal file scan ───────────────────
+    if file:
+        try:
+            file_bytes   = file.read()
+            file_name    = file.filename
+            file_size_kb = len(file_bytes) / 1024
+
+            # submit file to VirusTotal
+            upload_resp = requests.post(
+                'https://www.virustotal.com/api/v3/files',
+                headers=VT_HEADERS,
+                files={'file': (file_name, file_bytes)},
+                timeout=30
+            )
+            upload_data = upload_resp.json()
+
+            if 'data' not in upload_data:
+                return jsonify({'success': False, 'error': 'VirusTotal could not scan this file'}), 500
+
+            analysis_id = upload_data['data']['id']
+
+            # poll for result (max ~30s)
+            analysis = {}
+            for attempt in range(10):
+                time.sleep(3)
+                r = requests.get(
+                    f'https://www.virustotal.com/api/v3/analyses/{analysis_id}',
+                    headers=VT_HEADERS,
+                    timeout=15
+                )
+                analysis = r.json()
+                status = analysis.get('data', {}).get('attributes', {}).get('status', '')
+                if status == 'completed':
+                    break
+
+            attrs      = analysis.get('data', {}).get('attributes', {})
+            stats      = attrs.get('stats', {})
+            results    = attrs.get('results', {})
+            malicious  = stats.get('malicious', 0)
+            suspicious = stats.get('suspicious', 0)
+            undetected = stats.get('undetected', 0)
+            harmless   = stats.get('harmless', 0)
+            total      = malicious + suspicious + undetected + harmless
+
+            # determine verdict
+            if malicious >= 3:
+                verdict    = 'PHISHING'
+                risk_level = 'CRITICAL'
+                confidence = min(95, 60 + malicious * 5)
+            elif malicious >= 1 or suspicious >= 3:
+                verdict    = 'SUSPICIOUS'
+                risk_level = 'HIGH'
+                confidence = min(80, 40 + (malicious + suspicious) * 5)
+            elif suspicious >= 1:
+                verdict    = 'SUSPICIOUS'
+                risk_level = 'MEDIUM'
+                confidence = 40
+            else:
+                verdict    = 'LEGITIMATE'
+                risk_level = 'LOW'
+                confidence = 90
+
+            # collect flagged engines as red flags
+            red_flags = []
+            safe_indicators = []
+
+            for engine, res in results.items():
+                cat = res.get('category', '')
+                if cat in ('malicious', 'suspicious'):
+                    red_flags.append({
+                        'flag':   engine,
+                        'detail': f"Flagged as: {res.get('result', cat)}"
+                    })
+
+            red_flags = red_flags[:8]  # limit to 8
+
+            if harmless > 0:
+                safe_indicators.append(f'{harmless} engines found the file clean')
+            if malicious == 0:
+                safe_indicators.append('No malicious signatures detected')
+
+            if verdict == 'PHISHING':
+                recommendation = f'⛔ DO NOT open or share this file. {malicious} antivirus engines flagged it as malicious. Delete it immediately.'
+            elif verdict == 'SUSPICIOUS':
+                recommendation = f'⚠️ This file raised suspicion in {malicious + suspicious} engines. Avoid opening it unless you completely trust the source.'
+            else:
+                recommendation = f'✅ File appears clean. Scanned by {total} engines with no malicious detections. Always stay cautious.'
+
+            return jsonify({
+                'success':         True,
+                'verdict':         verdict,
+                'confidence':      confidence,
+                'riskLevel':       risk_level,
+                'isPhishing':      verdict == 'PHISHING',
+                'category':        f'File scan · {file_name} ({file_size_kb:.1f} KB)',
+                'summary':         f'{malicious} malicious · {suspicious} suspicious · {harmless + undetected} clean out of {total} engines',
+                'redFlags':        red_flags,
+                'safeIndicators':  safe_indicators,
+                'recommendation':  recommendation
+            })
+
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ── TEXT INPUT → AI analysis ─────────────────────────
+    elif text:
+        analysis_prompt = """Analyze the provided text message for phishing indicators.
+Return ONLY raw JSON, no markdown, no code fences:
+{
+  "verdict": "PHISHING",
+  "confidence": 91,
+  "riskLevel": "HIGH",
+  "isPhishing": true,
+  "category": "Banking Scam",
+  "summary": "Brief one-line summary",
+  "redFlags": [
+    {"flag": "Urgency pressure", "detail": "Uses Act immediately or lose access"},
+    {"flag": "Suspicious URL", "detail": "Link does not match official domain"}
+  ],
+  "safeIndicators": [],
+  "recommendation": "Delete this message. Do NOT click any links."
+}
+verdict must be one of: PHISHING, LEGITIMATE, SUSPICIOUS, UNKNOWN
+riskLevel must be one of: CRITICAL, HIGH, MEDIUM, LOW, SAFE
+confidence: 0-100
+"""
+        try:
+            result = json.loads(call_ai(
+    f"Analyze this message for phishing:\n\n{text}\n\n{analysis_prompt}"
+))
+            return jsonify({'success': True, **result})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    else:
+        return jsonify({'success': False, 'error': 'Please provide text or a file to analyze'}), 400
+
+# ── URL / WEBSITE SECURITY (VIRUS TOTAL) ────────────────────────────
+
+@app.route('/api/check-url', methods=['POST'])
+def check_url():
+    data = request.json
+    url  = data.get('url', '').strip()
+    if not url:
+        return jsonify({'success': False, 'error': 'No URL provided'}), 400
+
+    try:
+        # ── STEP 1: Submit URL to VirusTotal ──────────────────
+        submit = requests.post(
+            'https://www.virustotal.com/api/v3/urls',
+            headers=VT_HEADERS,
+            data={'url': url},
+            timeout=15
+        )
+        submit_data = submit.json()
+
+        if 'data' not in submit_data:
+            return jsonify({'success': False, 'error': 'VirusTotal rejected the URL'}), 500
+
+        analysis_id = submit_data['data']['id']
+
+        # ── STEP 2: Poll for results (max 20s) ────────────────
+        analysis = {}
+        for attempt in range(8):
+            time.sleep(3)
+            r = requests.get(
+                f'https://www.virustotal.com/api/v3/analyses/{analysis_id}',
+                headers=VT_HEADERS,
+                timeout=15
+            )
+            analysis = r.json()
+            status = analysis.get('data', {}).get('attributes', {}).get('status', '')
+            if status == 'completed':
+                break
+
+        # ── STEP 3: Parse results ─────────────────────────────
+        attrs   = analysis.get('data', {}).get('attributes', {})
+        stats   = attrs.get('stats', {})
+        results = attrs.get('results', {})
+
+        malicious   = stats.get('malicious', 0)
+        suspicious  = stats.get('suspicious', 0)
+        undetected  = stats.get('undetected', 0)
+        harmless    = stats.get('harmless', 0)
+        total_scans = malicious + suspicious + undetected + harmless
+
+        # risk score out of 100
+        if total_scans > 0:
+            risk_score = round(((malicious * 3 + suspicious * 1) / (total_scans * 3)) * 100)
+        else:
+            risk_score = 0
+
+        # verdict logic
+        if malicious >= 3:
+            verdict    = 'DANGEROUS'
+            risk_level = 'CRITICAL'
+        elif malicious >= 1 or suspicious >= 3:
+            verdict    = 'SUSPICIOUS'
+            risk_level = 'HIGH'
+        elif suspicious >= 1:
+            verdict    = 'SUSPICIOUS'
+            risk_level = 'MEDIUM'
+        else:
+            verdict    = 'SAFE'
+            risk_level = 'LOW'
+
+        # build per-engine flagged list (top 10 that flagged it)
+        flagged_engines = []
+        for engine, res in results.items():
+            if res.get('category') in ('malicious', 'suspicious'):
+                flagged_engines.append({
+                    'engine':   engine,
+                    'category': res.get('category', ''),
+                    'result':   res.get('result', '')
+                })
+        flagged_engines = flagged_engines[:10]
+
+        # build checks list for the UI
+        checks = [
+            {
+                'name':   'VirusTotal Scan',
+                'icon':   '🔬',
+                'status': 'fail' if malicious > 0 else ('warning' if suspicious > 0 else 'pass'),
+                'detail': f'{malicious} engines flagged as malicious, {suspicious} suspicious out of {total_scans} scanners'
+            },
+            {
+                'name':   'Malicious Detections',
+                'icon':   '☠️',
+                'status': 'fail' if malicious > 0 else 'pass',
+                'detail': f'{malicious} security vendors flagged this URL as malicious'
+            },
+            {
+                'name':   'Suspicious Signals',
+                'icon':   '⚠️',
+                'status': 'warning' if suspicious > 0 else 'pass',
+                'detail': f'{suspicious} vendors found suspicious activity'
+            },
+            {
+                'name':   'Clean Verdicts',
+                'icon':   '✅',
+                'status': 'pass',
+                'detail': f'{harmless + undetected} out of {total_scans} engines found no issues'
+            },
+            {
+                'name':   'HTTPS Check',
+                'icon':   '🔒',
+                'status': 'pass' if url.startswith('https') else 'warning',
+                'detail': 'Uses HTTPS encryption' if url.startswith('https') else 'Does not use HTTPS — data is not encrypted'
+            },
+            {
+                'name':   'Scan Coverage',
+                'icon':   '🌐',
+                'status': 'pass',
+                'detail': f'Analyzed by {total_scans} security engines on VirusTotal'
+            }
+        ]
+
+        # recommendation text
+        if verdict == 'DANGEROUS':
+            recommendation = f'⛔ DO NOT visit this website. {malicious} security engines flagged it as malicious. This URL is likely hosting malware, phishing content or scams.'
+        elif verdict == 'SUSPICIOUS':
+            recommendation = f'⚠️ Approach with caution. {malicious + suspicious} engines found issues. Avoid entering any personal information on this site.'
+        else:
+            recommendation = '✅ This URL appears clean across all VirusTotal scanners. Still, always be cautious before entering sensitive information on any website.'
+
+        return jsonify({
+            'success':        True,
+            'url':            url,
+            'verdict':        verdict,
+            'riskScore':      risk_score,
+            'riskLevel':      risk_level,
+            'isSafe':         verdict == 'SAFE',
+            'category':       f'Scanned by {total_scans} engines',
+            'summary':        f'{malicious} malicious · {suspicious} suspicious · {harmless + undetected} clean',
+            'checks':         checks,
+            'flaggedEngines': flagged_engines,
+            'stats':          stats,
+            'recommendation': recommendation
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({'success': False, 'error': 'VirusTotal took too long to respond. Try again.'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ── TRANSLATION (GROQ) ─────────────────────────────────────────
+
+@app.route('/api/translate', methods=['POST'])
+def translate():
+    data     = request.json
+    texts    = data.get('texts', {})      # dict of key: text
+    language = data.get('language', 'Hindi')
+
+    if not texts:
+        return jsonify({'success': False, 'error': 'No text provided'}), 400
+
+    if not isinstance(texts, dict):
+        return jsonify({'success': False, 'error': 'Texts must be a JSON object'}), 400
+
+    try:
+        # Small batches prevent output truncation and keep all original keys.
+        items = list(texts.items())
+        translated = {}
+        batch_size = 12
+        for i in range(0, len(items), batch_size):
+            chunk = dict(items[i:i + batch_size])
+            prompt = (f"Translate the values in this JSON object into {language}. "
+                      "Preserve every JSON key exactly, and preserve HTML tags, placeholders "
+                      "and emojis. Return only a valid JSON object with all supplied keys.\n"
+                      + json.dumps(chunk, ensure_ascii=False))
+            output = parse_ai_json(call_ai(prompt, json_mode=True, max_tokens=3000))
+            if not isinstance(output, dict) or set(output) != set(chunk) or not all(isinstance(v, str) for v in output.values()):
+                raise ValueError('Translation response did not preserve all keys. Please retry.')
+            translated.update(output)
+        return jsonify({'success': True, 'translated': translated, 'language': language})
+    except Exception as e:
+        app.logger.warning('Translation failed: %s', e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ── RUN ────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print("\n" + "="*55)
+    print("  Cyber Buddy Server Starting...")
+    print("  Visit: http://localhost:5000")
+    print("="*55 + "\n")
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=not IS_PROD)
